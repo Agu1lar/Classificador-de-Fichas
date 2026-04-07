@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.idea/
+
+# Local configuration
+config.json
+
+# Runtime folders
+logs/
+scan_debug/
+entrada/
+
+# Build artifacts
+build/
+dist/
+
+# PyInstaller
+*.spec.bak
+
+# OS / misc
+Thumbs.db

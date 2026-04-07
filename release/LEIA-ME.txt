@@ -1,0 +1,24 @@
+ORGANIZADOR DE FICHAS
+
+Arquivos desta release:
+- OrganizadorFichas.exe
+- config.json
+- LogoSetup_app.ico
+
+Uso:
+1. Execute OrganizadorFichas.exe
+2. Defina a Pasta matriz
+3. Defina a Pasta monitorada
+4. Clique em Iniciar monitoramento
+5. Envie os arquivos escaneados para a pasta monitorada
+
+Comportamento:
+- O app processa os arquivos por ordem de chegada
+- Quando le uma ficha, cria ou reutiliza a pasta do contrato
+- Arquivos sem ficha vao para o ultimo contrato ativo
+- O limite de arquivos consecutivos sem ficha e 3
+- O limite total por contrato na sequencia e 4
+
+Observacoes:
+- Se o Windows ainda mostrar icone antigo, reinicie o Explorer ou o computador
+- O config.json desta release esta limpo, sem caminhos pessoais
