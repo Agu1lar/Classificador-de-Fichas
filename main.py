@@ -26,17 +26,30 @@ except ImportError:
     pythoncom = None
 
 
-FICHA_REGEX = re.compile(r"\b(\d{6}-\d{2})\b")
-FICHA_SPLIT_REGEX = re.compile(r"\b(\d{6})\s*[-_/]?\s*(\d{2})\b")
-FICHA_CONTEXT_REGEX = re.compile(r"\b(?:ficha|contrato)\D{0,20}(\d{6})(?:\D{0,6}(\d{2}))?\b", re.IGNORECASE)
-FICHA_CONTEXT_OCR_REGEX = re.compile(
-    r"\b(?:ficha|contrato)\D{0,20}([0-9OQDGSBILZ]{6})(?:\D{0,6}([0-9OQDGSBILZ]{2}))?\b",
+FICHA_REGEX = re.compile(r"\b(\d{5,6}-\d{2})\b")
+FICHA_SPLIT_REGEX = re.compile(r"\b(\d{5,6})\s*[-_/]?\s*(\d{2})\b")
+FICHA_CONTEXT_REGEX = re.compile(
+    r"\b(?:ficha|contrato)\D{0,20}(\d{5,6})(?:\D{0,6}(\d{2}))?\b",
     re.IGNORECASE,
 )
-CONTRACT_REGEX = re.compile(r"^\d{6}$")
+FICHA_CONTEXT_OCR_REGEX = re.compile(
+    r"\b(?:ficha|contrato)\D{0,20}([0-9OQDGSBILZ]{5,6})(?:\D{0,6}([0-9OQDGSBILZ]{2}))?\b",
+    re.IGNORECASE,
+)
+CHECKLIST_CONTRACT_REGEX = re.compile(
+    r"(?:check[\s-]*list|plataforma|libera[çc][aã]o).{0,160}?(\d{5,6})(?:\D{0,10}(\d{2}))?\b",
+    re.IGNORECASE | re.DOTALL,
+)
+CHECKLIST_CONTRACT_OCR_REGEX = re.compile(
+    r"(?:check[\s-]*list|plataforma|libera[çc][aã]o).{0,160}?([0-9OQDGSBILZ]{5,6})(?:\D{0,10}([0-9OQDGSBILZ]{2}))?\b",
+    re.IGNORECASE | re.DOTALL,
+)
+STANDALONE_CONTRACT_DIGITS_REGEX = re.compile(r"\b(\d{5,6})\b")
+CONTRACT_FOLDER_NAME_REGEX = re.compile(r"^\d{5,6}$")
+CONTRACT_INPUT_REGEX = re.compile(r"^\d{5,6}$")
 FICHA_HINT_REGEX = re.compile(r"\bficha\b", re.IGNORECASE)
 FICHA_KEYWORDS = ("ficha", "contrato", "comprovante")
-REJECTION_KEYWORDS = ("telefone", "fone", "fax", "cel", "cnpj", "cep")
+REJECTION_KEYWORDS = ("telefone", "fone", "fax", "cel", "cnpj", "cep", "patrimonio", "patrimônio")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 PDF_EXTENSIONS = {".pdf"}
 OCR_DIGIT_MAP = str.maketrans({
@@ -314,10 +327,39 @@ def score_ficha_candidate(text: str, start: int, end: int) -> int:
     return score
 
 
+def score_checklist_standalone_contract_candidate(text: str, start: int, end: int) -> int:
+    window_start = max(0, start - 110)
+    window_end = min(len(text), end + 110)
+    context = text[window_start:window_end]
+    ctx_lower = context.lower()
+
+    score = 0
+    if "check" in ctx_lower and "list" in ctx_lower:
+        score += 9
+    if "plataforma" in ctx_lower:
+        score += 7
+    if "liberação" in context or "liberacao" in ctx_lower:
+        score += 6
+    if "libera" in ctx_lower and "plataforma" in ctx_lower:
+        score += 4
+    if "cliente" in ctx_lower or "obra" in ctx_lower:
+        score += 2
+    if any(keyword in ctx_lower for keyword in FICHA_KEYWORDS):
+        score += 4
+    if any(keyword in ctx_lower for keyword in REJECTION_KEYWORDS):
+        score -= 9
+    if start < max(140, int(len(text) * 0.42)):
+        score += 2
+    return score
+
+
 def normalize_ficha_candidate(number_a: str, number_b: Optional[str]) -> str:
+    core = number_a
+    if len(core) == 5 and core.isdigit():
+        core = core.zfill(6)
     if number_b:
-        return f"{number_a}-{number_b}"
-    return f"{number_a}-00"
+        return f"{core}-{number_b}"
+    return f"{core}-00"
 
 
 def normalize_ocr_digits(raw_value: str) -> str:
@@ -328,6 +370,9 @@ def generate_ficha_candidate_variants(number_a: str, number_b: Optional[str], co
     variants: list[tuple[int, str]] = []
     normalized_a = normalize_ocr_digits(number_a)
     normalized_b = normalize_ocr_digits(number_b) if number_b else None
+
+    if len(normalized_a) == 5 and normalized_a.isdigit():
+        normalized_a = normalized_a.zfill(6)
 
     base_candidate = normalize_ficha_candidate(normalized_a, normalized_b)
     variants.append((context_score, base_candidate))
@@ -364,6 +409,19 @@ def extract_ficha_number(text: str) -> Optional[str]:
         score = score_ficha_candidate(normalized_text, match.start(1), match.end(1)) + 7
         candidates.extend(generate_ficha_candidate_variants(match.group(1), match.group(2), score))
 
+    for match in CHECKLIST_CONTRACT_REGEX.finditer(normalized_text):
+        score = score_ficha_candidate(normalized_text, match.start(1), match.end(1)) + 9
+        candidates.extend(generate_ficha_candidate_variants(match.group(1), match.group(2), score))
+
+    for match in CHECKLIST_CONTRACT_OCR_REGEX.finditer(normalized_text):
+        score = score_ficha_candidate(normalized_text, match.start(1), match.end(1)) + 8
+        candidates.extend(generate_ficha_candidate_variants(match.group(1), match.group(2), score))
+
+    for match in STANDALONE_CONTRACT_DIGITS_REGEX.finditer(normalized_text):
+        score = score_checklist_standalone_contract_candidate(normalized_text, match.start(1), match.end(1))
+        if score >= 5:
+            candidates.extend(generate_ficha_candidate_variants(match.group(1), None, score))
+
     if not candidates:
         return None
 
@@ -396,11 +454,55 @@ def has_ficha_hint(text: str) -> bool:
 
 
 def get_contract_number(ficha_number: str) -> str:
-    return ficha_number.split("-", maxsplit=1)[0]
+    prefix = ficha_number.split("-", maxsplit=1)[0]
+    if len(prefix) == 5 and prefix.isdigit():
+        return prefix.zfill(6)
+    return prefix
 
 
-def move_file_to_contract_folder(file_path: Path, contract_number: str, matriz_dir: Path) -> Path:
-    destination_dir = matriz_dir / contract_number
+def same_contract_number(a: Optional[str], b: Optional[str]) -> bool:
+    if a is None or b is None:
+        return False
+    if not a.isdigit() or not b.isdigit():
+        return a == b
+    if len(a) > 6 or len(b) > 6:
+        return a == b
+    return int(a) == int(b)
+
+
+def resolve_contract_destination_dir(matriz_dir: Path, contract_number: str) -> tuple[Path, str]:
+    """Usa pasta existente (5 ou 6 digitos) se ja houver; senao cria a forma com 6 digitos."""
+    raw = contract_number.strip()
+    if not raw.isdigit() or len(raw) < 5 or len(raw) > 6:
+        p = matriz_dir / raw
+        return p, raw
+
+    canonical_six = raw.zfill(6)
+    stripped = str(int(canonical_six))
+
+    candidates: list[tuple[float, Path]] = []
+    seen_names: set[str] = set()
+    for name in (canonical_six, stripped):
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        p = matriz_dir / name
+        if p.is_dir() and CONTRACT_FOLDER_NAME_REGEX.fullmatch(p.name):
+            try:
+                candidates.append((p.stat().st_mtime, p))
+            except OSError:
+                continue
+
+    if candidates:
+        _ts, chosen = max(candidates, key=lambda item: item[0])
+        return chosen, chosen.name
+
+    new_path = matriz_dir / canonical_six
+    return new_path, canonical_six
+
+
+def move_file_to_contract_folder(file_path: Path, contract_number: str, matriz_dir: Path) -> tuple[Path, str]:
+    destination_dir, folder_name = resolve_contract_destination_dir(matriz_dir, contract_number)
     destination_dir.mkdir(parents=True, exist_ok=True)
 
     destination_path = destination_dir / file_path.name
@@ -413,7 +515,7 @@ def move_file_to_contract_folder(file_path: Path, contract_number: str, matriz_d
     for _ in range(FILE_READY_RETRIES):
         try:
             shutil.move(str(file_path), str(destination_path))
-            return destination_path
+            return destination_path, folder_name
         except PermissionError as exc:
             last_error = exc
             time.sleep(FILE_READY_DELAY_SECONDS)
@@ -456,7 +558,7 @@ def move_file_to_manual_review_folder(file_path: Path, matriz_dir: Path, reason:
 def find_recent_contract_folder(matriz_dir: Path) -> Optional[str]:
     contract_dirs: list[tuple[float, str]] = []
     for child in matriz_dir.iterdir():
-        if child.is_dir() and CONTRACT_REGEX.fullmatch(child.name):
+        if child.is_dir() and CONTRACT_FOLDER_NAME_REGEX.fullmatch(child.name):
             try:
                 modified_at = child.stat().st_mtime
             except OSError:
@@ -1029,8 +1131,8 @@ def process_file(file_path: Path, matriz_dir: Path, last_contract_number: Option
 
         if ficha_number:
             contract_number = get_contract_number(ficha_number)
-            destination = move_file_to_contract_folder(file_path, contract_number, matriz_dir)
-            return True, f"[OK] {file_path.name} -> contrato {contract_number} -> {destination}", contract_number
+            destination, folder_name = move_file_to_contract_folder(file_path, contract_number, matriz_dir)
+            return True, f"[OK] {file_path.name} -> contrato {folder_name} -> {destination}", folder_name
 
         if has_ficha_hint(extracted_text):
             logging.warning("Ficha detectada, mas numero nao lido no arquivo: %s", file_path.name)
@@ -1043,11 +1145,11 @@ def process_file(file_path: Path, matriz_dir: Path, last_contract_number: Option
             )
 
         if last_contract_number:
-            destination = move_file_to_contract_folder(file_path, last_contract_number, matriz_dir)
+            destination, folder_name = move_file_to_contract_folder(file_path, last_contract_number, matriz_dir)
             return (
                 True,
-                f"[COMPLEMENTO] {file_path.name} -> contrato {last_contract_number} -> {destination}",
-                last_contract_number,
+                f"[COMPLEMENTO] {file_path.name} -> contrato {folder_name} -> {destination}",
+                folder_name,
             )
 
         text_preview = re.sub(r"\s+", " ", extracted_text).strip()[:140] or "sem texto legivel"
@@ -1091,23 +1193,24 @@ def process_scanned_session_files(files: list[Path], matriz_dir: Path, status_ca
 
                 if ficha_number:
                     contract_number = get_contract_number(ficha_number)
-                    if contract_number != current_contract_number:
-                        current_contract_number = contract_number
+                    if not same_contract_number(contract_number, current_contract_number):
                         current_contract_document_count = 0
 
                     current_contract_document_count += 1
 
-                    destination = move_file_to_contract_folder(file_path, contract_number, matriz_dir)
-                    message = f"[OK] {file_path.name} -> contrato {contract_number} -> {destination}"
+                    destination, folder_name = move_file_to_contract_folder(file_path, contract_number, matriz_dir)
+                    current_contract_number = folder_name
+                    message = f"[OK] {file_path.name} -> contrato {folder_name} -> {destination}"
                     processed_count += 1
                     status_callback(message)
                     continue
 
                 if current_contract_number:
                     current_contract_document_count += 1
-                    destination = move_file_to_contract_folder(file_path, current_contract_number, matriz_dir)
+                    destination, folder_name = move_file_to_contract_folder(file_path, current_contract_number, matriz_dir)
+                    current_contract_number = folder_name
                     message = (
-                        f"[COMPLEMENTO] {file_path.name} -> contrato {current_contract_number} -> {destination}"
+                        f"[COMPLEMENTO] {file_path.name} -> contrato {folder_name} -> {destination}"
                     )
                     processed_count += 1
                     status_callback(message)
@@ -1167,25 +1270,25 @@ def process_incoming_file(
 
     if ficha_number:
         contract_number = get_contract_number(ficha_number)
-        if contract_number != current_contract_number:
+        if not same_contract_number(contract_number, current_contract_number):
             current_contract_document_count = 0
         current_fallback_count = 0
         current_contract_document_count += 1
 
-        destination = move_file_to_contract_folder(file_path, contract_number, matriz_dir)
-        message = f"[OK] {file_path.name} -> contrato {contract_number} -> {destination}"
-        return True, message, contract_number, current_contract_document_count, current_fallback_count, False
+        destination, folder_name = move_file_to_contract_folder(file_path, contract_number, matriz_dir)
+        message = f"[OK] {file_path.name} -> contrato {folder_name} -> {destination}"
+        return True, message, folder_name, current_contract_document_count, current_fallback_count, False
 
     if current_contract_number:
         current_fallback_count += 1
         current_contract_document_count += 1
 
-        destination = move_file_to_contract_folder(file_path, current_contract_number, matriz_dir)
+        destination, folder_name = move_file_to_contract_folder(file_path, current_contract_number, matriz_dir)
         message = (
-            f"[FALLBACK] {file_path.name} -> ficha nao lida; enviado para o ultimo contrato {current_contract_number} "
+            f"[FALLBACK] {file_path.name} -> ficha nao lida; enviado para o ultimo contrato {folder_name} "
             f"({current_fallback_count} consecutivo(s) sem ficha) -> {destination}"
         )
-        return True, message, current_contract_number, current_contract_document_count, current_fallback_count, False
+        return True, message, folder_name, current_contract_document_count, current_fallback_count, False
 
     text_preview = re.sub(r"\s+", " ", extracted_text).strip()[:140] or "sem texto legivel"
     review_reason = (
@@ -2002,20 +2105,32 @@ class OrganizerApp:
             messagebox.showwarning("Pasta matriz", "Defina a pasta matriz antes de pesquisar.")
             return
 
-        if not CONTRACT_REGEX.fullmatch(contract_number):
-            messagebox.showwarning("Contrato invalido", "Informe um numero de contrato com 6 digitos.")
+        if not CONTRACT_INPUT_REGEX.fullmatch(contract_number):
+            messagebox.showwarning("Contrato invalido", "Informe um numero de contrato com 5 ou 6 digitos.")
             return
 
         matriz_dir = Path(matriz_path)
-        contract_dir = matriz_dir / contract_number
+        normalized_six = contract_number.zfill(6)
+        stripped = str(int(normalized_six))
+        contract_dir = None
+        resolved_label = normalized_six
+        for candidate_name in (normalized_six, stripped):
+            candidate_path = matriz_dir / candidate_name
+            if candidate_path.is_dir() and CONTRACT_FOLDER_NAME_REGEX.fullmatch(candidate_name):
+                contract_dir = candidate_path
+                resolved_label = candidate_name
+                break
 
-        if not contract_dir.exists():
-            self.status_var.set(f"Contrato {contract_number} nao encontrado.")
-            self.append_log(f"[PESQUISA] Contrato nao encontrado: {contract_dir}")
-            messagebox.showinfo("Pesquisa", f"Nenhuma pasta encontrada para o contrato {contract_number}.")
+        if contract_dir is None:
+            self.status_var.set(f"Contrato {normalized_six} nao encontrado.")
+            self.append_log(f"[PESQUISA] Contrato nao encontrado: {matriz_dir / normalized_six}")
+            messagebox.showinfo(
+                "Pesquisa",
+                f"Nenhuma pasta encontrada para o contrato {normalized_six} (nem {stripped}).",
+            )
             return
 
-        self.status_var.set(f"Contrato {contract_number} localizado.")
+        self.status_var.set(f"Contrato {resolved_label} localizado.")
         self.append_log(f"[PESQUISA] Abrindo pasta do contrato: {contract_dir}")
         self.open_folder(contract_dir)
 
