@@ -80,10 +80,8 @@ WIA_FORMAT_JPEG = "{B96B3CAF-0728-11D3-9D7B-0000F81EF32E}"
 WIA_MAX_BATCH_PAGES = 200
 FILE_READY_RETRIES = 12
 FILE_READY_DELAY_SECONDS = 0.35
-SESSION_MAX_DOCUMENTS_PER_CONTRACT = 4
 MONITOR_POLL_SECONDS = 1.0
 MONITOR_STABLE_POLLS = 3
-MONITOR_MAX_FALLBACK_FILES_PER_BATCH = 3
 
 
 def configure_tesseract() -> None:
@@ -190,32 +188,55 @@ def preprocess_image_adaptive(image: np.ndarray) -> np.ndarray:
     )
 
 
-def image_to_text(image: np.ndarray, psm: int = 6, adaptive: bool = False) -> str:
+def image_to_text(
+    image: np.ndarray,
+    psm: int = 6,
+    adaptive: bool = False,
+    extra_config: str = "",
+) -> str:
     processed = preprocess_image_adaptive(image) if adaptive else preprocess_image(image)
-    config = f"--oem 3 --psm {psm}"
+    config = f"--oem 3 --psm {psm} {extra_config}".strip()
     return pytesseract.image_to_string(processed, lang=OCR_LANGUAGE, config=config)
 
 
-def get_image_regions(image: np.ndarray) -> list[tuple[str, np.ndarray, int, bool]]:
+def get_image_regions(image: np.ndarray) -> list[tuple[str, np.ndarray, int, bool, str]]:
     height, width = image.shape[:2]
     top_end = max(1, int(height * 0.38))
     right_start = max(0, int(width * 0.68))
     center_start = max(0, int(width * 0.52))
     bottom_start = max(0, int(height * 0.55))
+    contract_top_end = max(1, int(height * 0.22))
+    contract_right_start = max(0, int(width * 0.72))
+    contract_tight_top_end = max(1, int(height * 0.17))
+    contract_tight_right_start = max(0, int(width * 0.77))
 
     return [
-        ("full", image, 6, False),
-        ("full_adaptive", image, 6, True),
-        ("top", image[:top_end, :], 6, False),
-        ("top_adaptive", image[:top_end, :], 6, True),
-        ("top_right", image[:top_end, right_start:], 6, True),
-        ("top_right_single", image[:top_end, right_start:], 11, True),
-        ("right_strip", image[:, center_start:], 6, True),
-        ("bottom", image[bottom_start:, :], 6, True),
+        ("full", image, 6, False, ""),
+        ("full_adaptive", image, 6, True, ""),
+        ("top", image[:top_end, :], 6, False, ""),
+        ("top_adaptive", image[:top_end, :], 6, True, ""),
+        ("top_right", image[:top_end, right_start:], 6, True, ""),
+        ("top_right_single", image[:top_end, right_start:], 11, True, ""),
+        (
+            "top_right_contract",
+            image[:contract_top_end, contract_right_start:],
+            7,
+            True,
+            "-c tessedit_char_whitelist=0123456789-",
+        ),
+        (
+            "top_right_contract_tight",
+            image[:contract_tight_top_end, contract_tight_right_start:],
+            8,
+            True,
+            "-c tessedit_char_whitelist=0123456789-",
+        ),
+        ("right_strip", image[:, center_start:], 6, True, ""),
+        ("bottom", image[bottom_start:, :], 6, True, ""),
     ]
 
 
-def generate_oriented_regions(image: np.ndarray) -> list[tuple[str, np.ndarray, int, bool]]:
+def generate_oriented_regions(image: np.ndarray) -> list[tuple[str, np.ndarray, int, bool, str]]:
     orientations = [
         ("r0", image),
         ("r180", cv2.rotate(image, cv2.ROTATE_180)),
@@ -223,20 +244,20 @@ def generate_oriented_regions(image: np.ndarray) -> list[tuple[str, np.ndarray, 
         ("r270", cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)),
     ]
 
-    regions: list[tuple[str, np.ndarray, int, bool]] = []
+    regions: list[tuple[str, np.ndarray, int, bool, str]] = []
     for orientation_name, oriented_image in orientations:
-        for region_name, region_image, psm, adaptive in get_image_regions(oriented_image):
-            regions.append((f"{orientation_name}_{region_name}", region_image, psm, adaptive))
+        for region_name, region_image, psm, adaptive, extra_config in get_image_regions(oriented_image):
+            regions.append((f"{orientation_name}_{region_name}", region_image, psm, adaptive, extra_config))
     return regions
 
 
 def image_to_text_variants(image: np.ndarray) -> list[str]:
     variants: list[str] = []
-    for region_name, region_image, psm, adaptive in generate_oriented_regions(image):
+    for region_name, region_image, psm, adaptive, extra_config in generate_oriented_regions(image):
         if region_image.size == 0:
             continue
         try:
-            text = image_to_text(region_image, psm=psm, adaptive=adaptive)
+            text = image_to_text(region_image, psm=psm, adaptive=adaptive, extra_config=extra_config)
         except Exception as exc:
             write_scan_debug(f"image_to_text_variants -> {region_name} error: {exc}")
             continue
@@ -346,9 +367,24 @@ def extract_ficha_number(text: str) -> Optional[str]:
     if not candidates:
         return None
 
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    best_score, best_candidate = candidates[0]
-    write_scan_debug(f"extract_ficha_number -> candidates={candidates[:6]}")
+    candidate_scores: dict[str, int] = {}
+    for score, candidate in candidates:
+        current = candidate_scores.get(candidate)
+        if current is None or score > current:
+            candidate_scores[candidate] = score
+
+    ranked_candidates = sorted(candidate_scores.items(), key=lambda item: item[1], reverse=True)
+    best_candidate, best_score = ranked_candidates[0]
+
+    # Heuristica para confusao comum do OCR no primeiro digito (0 vs 6/9).
+    if len(best_candidate) == 9 and best_candidate[0] in {"6", "9"}:
+        zero_candidate = f"0{best_candidate[1:]}"
+        zero_score = candidate_scores.get(zero_candidate)
+        if zero_score is not None and zero_score >= best_score - 2:
+            best_candidate = zero_candidate
+            best_score = zero_score
+
+    write_scan_debug(f"extract_ficha_number -> candidates={ranked_candidates[:6]}")
     if best_score < 3:
         return None
     return best_candidate
@@ -1060,21 +1096,6 @@ def process_scanned_session_files(files: list[Path], matriz_dir: Path, status_ca
                         current_contract_document_count = 0
 
                     current_contract_document_count += 1
-                    if current_contract_document_count > SESSION_MAX_DOCUMENTS_PER_CONTRACT:
-                        message = (
-                            f"[AVISO] Limite de {SESSION_MAX_DOCUMENTS_PER_CONTRACT} documentos atingido para o contrato "
-                            f"{current_contract_number}. O processamento foi encerrado porque pode haver erro no scaneamento."
-                        )
-                        failure_messages.append(message)
-                        status_callback(message)
-                        finish_callback(
-                            "Processamento encerrado por limite de seguranca.\n"
-                            f"Sucesso: {processed_count}\n"
-                            f"Falhas: {failed_count + 1}\n"
-                            f"Log: {log_file}\n"
-                            f"{message}"
-                        )
-                        return
 
                     destination = move_file_to_contract_folder(file_path, contract_number, matriz_dir)
                     message = f"[OK] {file_path.name} -> contrato {contract_number} -> {destination}"
@@ -1084,22 +1105,6 @@ def process_scanned_session_files(files: list[Path], matriz_dir: Path, status_ca
 
                 if current_contract_number:
                     current_contract_document_count += 1
-                    if current_contract_document_count > SESSION_MAX_DOCUMENTS_PER_CONTRACT:
-                        message = (
-                            f"[AVISO] Limite de {SESSION_MAX_DOCUMENTS_PER_CONTRACT} documentos atingido para o contrato "
-                            f"{current_contract_number}. O processamento foi encerrado porque pode haver erro no scaneamento."
-                        )
-                        failure_messages.append(message)
-                        status_callback(message)
-                        finish_callback(
-                            "Processamento encerrado por limite de seguranca.\n"
-                            f"Sucesso: {processed_count}\n"
-                            f"Falhas: {failed_count + 1}\n"
-                            f"Log: {log_file}\n"
-                            f"{message}"
-                        )
-                        return
-
                     destination = move_file_to_contract_folder(file_path, current_contract_number, matriz_dir)
                     message = (
                         f"[COMPLEMENTO] {file_path.name} -> contrato {current_contract_number} -> {destination}"
@@ -1167,38 +1172,18 @@ def process_incoming_file(
         current_fallback_count = 0
         current_contract_document_count += 1
 
-        if current_contract_document_count > SESSION_MAX_DOCUMENTS_PER_CONTRACT:
-            warning = (
-                f"[AVISO] Limite de {SESSION_MAX_DOCUMENTS_PER_CONTRACT} documentos atingido para o contrato "
-                f"{contract_number}. O monitoramento sera encerrado porque pode haver erro no scaneamento."
-            )
-            return False, warning, contract_number, current_contract_document_count, current_fallback_count, True
-
         destination = move_file_to_contract_folder(file_path, contract_number, matriz_dir)
         message = f"[OK] {file_path.name} -> contrato {contract_number} -> {destination}"
         return True, message, contract_number, current_contract_document_count, current_fallback_count, False
 
     if current_contract_number:
         current_fallback_count += 1
-        if current_fallback_count > MONITOR_MAX_FALLBACK_FILES_PER_BATCH:
-            warning = (
-                f"[AVISO] Limite de {MONITOR_MAX_FALLBACK_FILES_PER_BATCH} arquivos consecutivos sem ficha "
-                f"atingido no contrato {current_contract_number}. O monitoramento sera encerrado para evitar roteamento incorreto."
-            )
-            return False, warning, current_contract_number, current_contract_document_count, current_fallback_count, True
-
         current_contract_document_count += 1
-        if current_contract_document_count > SESSION_MAX_DOCUMENTS_PER_CONTRACT:
-            warning = (
-                f"[AVISO] Limite de {SESSION_MAX_DOCUMENTS_PER_CONTRACT} documentos atingido para o contrato "
-                f"{current_contract_number}. O monitoramento sera encerrado porque pode haver erro no scaneamento."
-            )
-            return False, warning, current_contract_number, current_contract_document_count, current_fallback_count, True
 
         destination = move_file_to_contract_folder(file_path, current_contract_number, matriz_dir)
         message = (
             f"[FALLBACK] {file_path.name} -> ficha nao lida; enviado para o ultimo contrato {current_contract_number} "
-            f"({current_fallback_count}/{MONITOR_MAX_FALLBACK_FILES_PER_BATCH}) -> {destination}"
+            f"({current_fallback_count} consecutivo(s) sem ficha) -> {destination}"
         )
         return True, message, current_contract_number, current_contract_document_count, current_fallback_count, False
 
@@ -1242,9 +1227,6 @@ def run_realtime_monitor(input_dir: Path, matriz_dir: Path, status_callback, fin
 
             processed_any_file = False
             for file_path in files:
-                if should_stop():
-                    break
-
                 file_key = str(file_path)
                 previous_size, stable_polls = file_stability.get(file_key, (None, 0))
                 is_stable, current_size = is_file_stable_for_processing(file_path, previous_size)
@@ -1956,11 +1938,21 @@ class OrganizerApp:
             self.append_log("[SCAN] Parada solicitada pelo usuario. O app vai processar os documentos na ordem de scaneamento.")
             return
 
-        self.status_var.set("Parada solicitada. O app vai concluir os arquivos pendentes antes de encerrar.")
-        self.append_log("[MONITOR] Parada solicitada. O monitoramento so sera encerrado quando a fila estiver vazia.")
+        input_path = self.input_var.get().strip()
+        input_dir = Path(input_path) if input_path else INPUT_DIR
+        pending_files = len(list(supported_files(input_dir)))
+        if pending_files > 0:
+            self.status_var.set(f"Parada solicitada. O app vai concluir {pending_files} arquivo(s) pendente(s) antes de encerrar.")
+            self.append_log(
+                f"[MONITOR] Parada solicitada. Restam {pending_files} arquivo(s) na pasta monitorada; o encerramento ocorrera quando a fila ficar vazia."
+            )
+            return
+
+        self.status_var.set("Parada solicitada. Nenhum arquivo pendente encontrado; o monitoramento sera encerrado em seguida.")
+        self.append_log("[MONITOR] Parada solicitada. Nenhum arquivo pendente encontrado na pasta monitorada.")
 
     def should_stop_scanning(self) -> bool:
-        return self.scan_stop_event.is_set()
+        return self.scan_stop_event.is_set() or self.stop_when_safe
 
     def thread_safe_log(self, message: str) -> None:
         self.root.after(0, lambda: self.append_log(message))
